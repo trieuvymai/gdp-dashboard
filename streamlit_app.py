@@ -1,151 +1,110 @@
-import streamlit as st
+import yfinance as yf
 import pandas as pd
-import math
-from pathlib import Path
+import numpy as np
+import streamlit as st
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from pycoingecko import CoinGeckoAPI
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+st.title("📈 Price Forecasting Dashboard (Stocks & Crypto, LSTM)")
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# User input
+mode = st.selectbox("Select Asset Type", ["Stock", "Crypto"])
+if mode == "Stock":
+    symbol = st.text_input("Enter Stock Ticker (e.g., AAPL, MSFT)", value="AAPL")
+else:
+    symbol = st.text_input("Enter Crypto ID (e.g., bitcoin, ethereum)", value="bitcoin")
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+def fetch_data(symbol, mode):
+    if mode == "Stock":
+        df = yf.download(symbol, period="1y")
+        df = df[['Close']]
+    else:
+        cg = CoinGeckoAPI()
+        data = cg.get_coin_market_chart_by_id(id=symbol, vs_currency='usd', days=365)
+        df = pd.DataFrame(data['prices'], columns=['timestamp', 'Close'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df = df.resample('1D').mean().dropna()
+    return df
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+def add_indicators(df):
+    df['MA10'] = df['Close'].rolling(window=10).mean()
+    df['MA50'] = df['Close'].rolling(window=50).mean()
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    return df.dropna()
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+def create_sequences(data, time_steps=30):
+    X, y = [], []
+    for i in range(time_steps, len(data)):
+        X.append(data[i-time_steps:i])
+        y.append(data[i])
+    return np.array(X), np.array(y)
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+def build_lstm_model(input_shape):
+    model = Sequential([
+        LSTM(50, return_sequences=True, input_shape=input_shape),
+        LSTM(50),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    return model
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+if st.button("Forecast"):
+    with st.spinner("Fetching data and training model..."):
+        df = fetch_data(symbol, mode)
+        if df.empty:
+            st.error("Failed to fetch data. Check the input.")
+            st.stop()
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+        df = add_indicators(df)
+        st.line_chart(df[['Close', 'MA10', 'MA50']])
 
-    return gdp_df
+        # Scale data
+        scaler = MinMaxScaler()
+        scaled_data = scaler.fit_transform(df[['Close']])
 
-gdp_df = get_gdp_data()
+        time_steps = 30
+        X, y = create_sequences(scaled_data, time_steps)
+        X = X.reshape(X.shape[0], X.shape[1], 1)
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+        # Train-test split
+        split = int(0.8 * len(X))
+        X_train, X_test = X[:split], X[split:]
+        y_train, y_test = y[:split], y[split:]
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+        # Build and train model
+        model = build_lstm_model((X_train.shape[1], 1))
+        model.fit(X_train, y_train, epochs=20, batch_size=32, verbose=0)
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+        # Predict
+        predicted = model.predict(X_test)
+        predicted_prices = scaler.inverse_transform(predicted)
+        actual_prices = scaler.inverse_transform(y_test)
 
-# Add some spacing
-''
-''
+        st.subheader("Actual vs Predicted Prices")
+        fig, ax = plt.subplots(figsize=(12, 5))
+        ax.plot(actual_prices, label='Actual')
+        ax.plot(predicted_prices, label='Predicted')
+        ax.set_title(f"Price Prediction for {symbol}")
+        ax.legend()
+        st.pyplot(fig)
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+        # Multi-step forecast (next 7 days)
+        future_prices = []
+        last_seq = scaled_data[-time_steps:].reshape(1, time_steps, 1)
+        for _ in range(7):
+            next_pred = model.predict(last_seq)[0][0]
+            future_prices.append(next_pred)
+            last_seq = np.append(last_seq[:, 1:, :], [[[next_pred]]], axis=1)
+        forecasted = scaler.inverse_transform(np.array(future_prices).reshape(-1, 1))
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+        st.success(f"Next day predicted price: ${forecasted[0][0]:.2f}")
+        st.subheader("7-Day Forecast")
+        st.line_chart(pd.Series(forecasted.flatten(), name="Forecast"))
